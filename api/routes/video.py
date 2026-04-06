@@ -19,7 +19,7 @@ from sqlalchemy.sql import text
 
 from api.core import logger, get_db_session, metrics, reset_db_connections
 from db import Player
-from db.models import Group, user_group_association
+from db.models import user_group_association
 from db.models.video_upload import VideoUpload
 from utils.b2_storage import (
     generate_presigned_upload_url,
@@ -44,23 +44,6 @@ VIDEO_LOCAL_MAX_UPLOAD_BYTES = max(
     1 * 1024 * 1024,
     int(os.getenv("VIDEO_LOCAL_MAX_UPLOAD_BYTES", str(32 * 1024 * 1024))),
 )
-
-use_b2 = True ## TODO -- decide if b2 is long-term or not  
-
-def _get_daily_limit_for_group(group_id: int, db_session) -> int:
-    """
-    Determine the daily video upload limit for a player.
-    
-    Checks if the player (or any of their groups) has an active premium
-    feature activation for video uploads. Falls back to the free tier limit.
-    """
-    try:
-        premium_status = db_session.execute(text("SELECT * FROM xenforo.xf_dt_group_upgrade_active WHERE group_id = :group_id AND is_cancelled = 0 AND group_upgrade_id > 2"), {"group_id": group_id}).first()
-        if premium_status:
-            return VIDEO_DAILY_LIMIT_PREMIUM
-    except Exception as e:
-        print(f"[Video] Error checking premium status: {e}")
-    return VIDEO_DAILY_LIMIT_FREE
 
 
 def _get_daily_upload_count_for_group(group_id: int, db_session) -> int:
@@ -88,19 +71,6 @@ def _get_daily_upload_count_for_group(group_id: int, db_session) -> int:
     )
     return int(count or 0)
 
-def _get_daily_upload_count(player_id: int, db_session) -> int:
-    """Count today's video uploads for a player."""
-    from sqlalchemy import func, and_
-    today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    count = db_session.query(func.count(VideoUpload.id)).filter(
-        and_(
-            VideoUpload.player_id == player_id,
-            VideoUpload.created_at >= today_start,
-        )
-    ).scalar()
-    return count or 0
-
-
 def _normalize_fps(value) -> int:
     """Validate and normalize FPS value."""
     try:
@@ -112,40 +82,39 @@ def _normalize_fps(value) -> int:
         return 20
 
 
-def _get_player_groups(db_session, player_id: int) -> list[Group]:
-    """Fetch groups the player belongs to (DB-only, avoids circular imports)."""
-    try:
-        return (
-            db_session.query(Group)
-            .join(user_group_association, Group.group_id == user_group_association.c.group_id)
-            .filter(user_group_association.c.player_id == player_id)
-            .all()
-        )
-    except Exception:
-        return []
-
-
-def _has_premium_for_uploads(player, db_session) -> Group:
+def _get_premium_group_id_for_player(player_id: int, db_session) -> Optional[int]:
     """
-    Check if the player is part of a group with an active premium group upgrade
-    that grants access to video uploads.
+    Resolve one premium group for a player in a single SQL round-trip.
 
-    Note: In production, `xenforo.xf_dt_group_upgrade_active.group_upgrade_id` is not
-    necessarily "3" for tier 3. We treat any upgrade id > 2 as premium access, to
-    match `_get_daily_limit_for_group()`.
+    This replaces the previous N+1 flow that loaded all player groups first and
+    then checked each group's premium upgrade status individually.
     """
-    player_groups = _get_player_groups(db_session, player.player_id)
-    for group in player_groups:
-        premium_status = db_session.execute(
-            text(
-                "SELECT * FROM xenforo.xf_dt_group_upgrade_active "
-                "WHERE group_id = :group_id AND is_cancelled = 0 AND group_upgrade_id > 2"
-            ),
-            {"group_id": group.group_id},
-        ).first()
-        if premium_status:
-            return group
-    return None ## No premium group found
+    row = db_session.execute(
+        text(
+            "SELECT uga.group_id "
+            "FROM user_group_association uga "
+            "JOIN xenforo.xf_dt_group_upgrade_active xf ON xf.group_id = uga.group_id "
+            "WHERE uga.player_id = :player_id "
+            "AND xf.is_cancelled = 0 "
+            "AND xf.group_upgrade_id > 2 "
+            "ORDER BY uga.group_id ASC "
+            "LIMIT 1"
+        ),
+        {"player_id": player_id},
+    ).first()
+    if not row:
+        return None
+    return int(row[0])
+
+
+def _get_active_video_backend() -> str:
+    """
+    Return the configured upload backend for this process.
+
+    This keeps local/B2 behavior runtime-configurable via env settings rather
+    than a hardcoded module-level flag.
+    """
+    return normalize_backend(VIDEO_STORAGE_BACKEND_DEFAULT)
 
 
 async def _resolve_upload_context(db_session, acc_hash: str):
@@ -164,10 +133,10 @@ async def _resolve_upload_context(db_session, acc_hash: str):
     if not player:
         return None, None, None, None, (jsonify({"error": "Player not found"}), 404)
 
-    premium_group = await asyncio.to_thread(
-        lambda: _has_premium_for_uploads(player, db_session)
+    premium_group_id = await asyncio.to_thread(
+        lambda: _get_premium_group_id_for_player(player.player_id, db_session)
     )
-    if not premium_group:
+    if not premium_group_id:
         return None, None, None, None, (
             jsonify(
                 {"error": "Player is not a member of a group who has subscribed for access to video uploads."}
@@ -175,11 +144,10 @@ async def _resolve_upload_context(db_session, acc_hash: str):
             402,
         )
 
-    daily_limit = await asyncio.to_thread(
-        lambda: _get_daily_limit_for_group(premium_group.group_id, db_session)
-    )
+    # Membership query already validates active premium status, so this is fixed.
+    daily_limit = VIDEO_DAILY_LIMIT_PREMIUM
     today_count = await asyncio.to_thread(
-        lambda: _get_daily_upload_count_for_group(premium_group.group_id, db_session)
+        lambda: _get_daily_upload_count_for_group(premium_group_id, db_session)
     )
 
     if today_count >= daily_limit:
@@ -199,7 +167,7 @@ async def _resolve_upload_context(db_session, acc_hash: str):
             402,
         )
 
-    return player, premium_group, daily_limit, today_count, None
+    return player, premium_group_id, daily_limit, today_count, None
 
 
 async def _create_upload_ticket(db_session, player_id: int, fps: int, storage_backend: str) -> VideoUpload:
@@ -270,15 +238,6 @@ UPLOAD_TICKET_ISSUERS = {
     "local": _issue_upload_ticket_local,
 }
 
-# -----------------------------------------------------------------------------
-# 1:1 swappable upload ticket issuers for /presigned_upload_url
-# Flip the assignment to switch implementations without touching endpoint logic.
-# -----------------------------------------------------------------------------
-if use_b2:
-    upload_ticket_issue_impl = _issue_upload_ticket_b2
-else:
-    upload_ticket_issue_impl = _issue_upload_ticket_local
-
 
 @video_bp.get("/presigned_upload_url")
 @rate_limit(limit=10, period=timedelta(seconds=1))
@@ -310,17 +269,18 @@ async def presigned_upload_url():
         if error_response:
             return error_response
 
-        # Runtime backend default can still be used as a guardrail, but the
-        # explicit function pointer above is the primary "easy swap" control.
-        configured_backend = normalize_backend(VIDEO_STORAGE_BACKEND_DEFAULT)
-        _ = configured_backend  # intentionally kept for visibility in logs/debug
-        ticket = await upload_ticket_issue_impl(db_session, player.player_id, fps)
+        active_backend = _get_active_video_backend()
+        issue_impl = UPLOAD_TICKET_ISSUERS.get(active_backend, _issue_upload_ticket_b2)
+        ticket = await issue_impl(db_session, player.player_id, fps)
 
         metrics.record_request("video_presigned_url", True, app="new_api")
 
         logger.log_sync(
             "info",
-            f"[Video] Presigned URL issued player_id={player.player_id} fps={fps} key={ticket['key']}",
+            (
+                f"[Video] Presigned URL issued player_id={player.player_id} "
+                f"fps={fps} backend={active_backend} key={ticket['key']}"
+            ),
         )
 
         payload = {
@@ -330,6 +290,7 @@ async def presigned_upload_url():
             "upload_id": ticket.get("upload_id"),
             "daily_limit": daily_limit,
             "daily_used": today_count + 1,
+            "storage_backend": active_backend,
         }
         return jsonify(payload), 200
 
@@ -578,17 +539,6 @@ async def _complete_upload_internal(db_session, video_key: str, acc_hash: str):
     ), 200
 
 
-# -----------------------------------------------------------------------------
-# 1:1 swappable upload completion handlers for /video/upload-complete
-# Flip the assignment to switch implementations without touching endpoint logic.
-# -----------------------------------------------------------------------------
-# upload_complete_impl = _complete_upload_b2
-if use_b2:
-    upload_complete_impl = _complete_upload_b2
-else:   
-    upload_complete_impl = _complete_upload_internal
-
-
 @video_bp.post("/video/local/test-upload-complete")
 @rate_limit(limit=10, period=timedelta(seconds=1))
 async def local_test_upload_complete():
@@ -657,7 +607,9 @@ async def video_upload_complete():
             return jsonify({"error": "Missing 'acc_hash' field"}), 400
 
         db_session = get_db_session()
-        return await upload_complete_impl(db_session, video_key, acc_hash)
+        active_backend = _get_active_video_backend()
+        complete_impl = _complete_upload_internal if active_backend == "local" else _complete_upload_b2
+        return await complete_impl(db_session, video_key, acc_hash)
 
     except Exception as e:
         logger.log_sync("error", f"Error confirming video upload: {e}")
