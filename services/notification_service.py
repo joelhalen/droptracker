@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+from urllib.parse import quote
 import shutil
 from datetime import datetime, timedelta
 import interactions
@@ -194,7 +195,7 @@ class NotificationService:
         qp_percentage = str(data.get("qp_percentage") or "N/A")
         submitted_at = self._coerce_int(data.get("timestamp"))
 
-        player_link = f"[{player_name}](https://www.droptracker.io/players/{player_name}.{player_id}/view)"
+        player_link = f"[{player_name}](https://www.droptracker.io/players/{quote(player_name, safe='')}.{player_id}/view)"
         embed = interactions.Embed(
             title="Quest Completed",
             description=f"{player_link} completed **{quest_name}**.",
@@ -800,7 +801,7 @@ class NotificationService:
             formatted_name = get_formatted_name(player_name, group_id, db_session)
 
             replacements = {
-                "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{player_name}.{player_id}/view)",
+                "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{quote(player_name, safe='')}.{player_id}/view)",
                 "{skill_name}": str(data.get("skill_name") or data.get("skills_names") or ""),
                 "{skills_names}": str(data.get("skills_names") or ""),
                 "{skills_text}": str(skills_text or ""),
@@ -898,7 +899,7 @@ class NotificationService:
             raw_xp_total = str(data.get("xp_total") or "")
             xp_total = format_number(raw_xp_total)
             replacements = {
-                "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{player_name}.{player_id}/view)",
+                "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{quote(player_name, safe='')}.{player_id}/view)",
                 "{skill_name}": str(data.get("skill_name") or data.get("skills_names") or ""),
                 "{skills_names}": str(data.get("skills_names") or ""),
                 "{skills_text}": str(skills_text or ""),
@@ -988,7 +989,7 @@ class NotificationService:
             formatted_name = get_formatted_name(player_name, group_id, db_session)
             if embed_template:
                 replacements = {
-                    "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{player_name}.{player_id}/view)",
+                    "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{quote(player_name, safe='')}.{player_id}/view)",
                     "{quest_name}": str(quest_name),
                     "{quests_completed}": str(data.get("quests_completed") or ""),
                     "{total_quests}": str(data.get("total_quests") or ""),
@@ -1098,7 +1099,7 @@ class NotificationService:
             formatted_name = get_formatted_name(player_name, group_id, session)
             if embed_template:
                 replacements = {
-                    "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{player_name}.{player_id}/view)",
+                    "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{quote(player_name, safe='')}.{player_id}/view)",
                     "{quest_name}": str(quest_name),
                     "{quests_completed}": str(data.get("quests_completed") or ""),
                     "{total_quests}": str(data.get("total_quests") or ""),
@@ -1859,7 +1860,7 @@ class NotificationService:
                 "{item_value}": "`" + format_number(total_value) + "`",
                 "{quantity}": "`" + str(quantity) + "`",
                 "{total_value}": "`" + str(total_value) + "`",
-                "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{player_name}.{player_id}/view)",
+                "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{quote(player_name, safe='')}.{player_id}/view)",
                 # Prefer video for display; keep image_url for attachments/local files.
                 "{image_url}": video_url or image_url or "",
                 "{video_url}": video_url or "",
@@ -2109,7 +2110,7 @@ class NotificationService:
                 "{item_value}": "`" + format_number(total_value) + "`",
                 "{quantity}": "`" + str(quantity) + "`",
                 "{total_value}": "`" + str(total_value) + "`",
-                "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{player_name}.{player_id}/view)",
+                "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{quote(player_name, safe='')}.{player_id}/view)",
                 "{image_url}": image_url or ""
             }
             values.update(self._group_points_placeholder_map(data))
@@ -2502,7 +2503,7 @@ class NotificationService:
             formatted_name = get_formatted_name(player_name, group_id, db_session)
             
             replacements = {
-                "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{player_name}.{player_id}/view)",
+                "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{quote(player_name, safe='')}.{player_id}/view)",
                 "{global_rank}": str(global_placement),
                 "{total_ranked_global}": str(total_ranked_global),
                 "{group_rank}": str(group_placement),
@@ -2691,7 +2692,7 @@ class NotificationService:
             formatted_name = get_formatted_name(player_name, group_id, session)
             
             replacements = {
-                "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{player_name}.{player_id}/view)",
+                "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{quote(player_name, safe='')}.{player_id}/view)",
                 "{global_rank}": str(global_placement),
                 "{total_ranked_global}": str(total_ranked_global),
                 "{group_rank}": str(group_placement),
@@ -2779,7 +2780,7 @@ class NotificationService:
         kc_received = milestone if milestone else killcount
         
         value_dict = {
-            "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{player_name}.{player_id}/view)",
+            "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{quote(player_name, safe='')}.{player_id}/view)",
             "{pet_name}": pet_name,
             "{source}": source,
             "{npc_name}": npc_name,
@@ -2904,7 +2905,7 @@ class NotificationService:
         kc_received = milestone if milestone else killcount
         
         value_dict = {
-            "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{player_name}.{player_id}/view)",
+            "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{quote(player_name, safe='')}.{player_id}/view)",
             "{pet_name}": pet_name,
             "{source}": source,
             "{npc_name}": npc_name,
@@ -3046,7 +3047,7 @@ class NotificationService:
                 points_left = "Unknown"
             if embed_template:
                 value_dict = {
-                    "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{player_name}.{player_id}/view)",
+                    "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{quote(player_name, safe='')}.{player_id}/view)",
                     "{task_name}": formatted_task_name,
                     "{current_tier}": actual_tier,
                     "{progress}": progress,
@@ -3211,7 +3212,7 @@ class NotificationService:
                 points_left = "Unknown"
             if embed_template:
                 value_dict = {
-                    "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{player_name}.{player_id}/view)",
+                    "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{quote(player_name, safe='')}.{player_id}/view)",
                     "{task_name}": formatted_task_name,
                     "{current_tier}": actual_tier,
                     "{progress}": progress,
@@ -3335,7 +3336,7 @@ class NotificationService:
             user_count = format_number(redis_client.client.zcard(f"leaderboard:{partition}:group:{group_id}"))
             # Replace placeholders
             replacements = {
-                "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{player_name}.{player_id}/view)",
+                "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{quote(player_name, safe='')}.{player_id}/view)",
                 "{player_loot_month}": player_month_total,
                 "{kc_received}": kc,
                 "{item_name}": item_name,
@@ -3477,7 +3478,7 @@ class NotificationService:
             user_count = format_number(redis_client.client.zcard(f"leaderboard:{partition}:group:{group_id}"))
             # Replace placeholders
             replacements = {
-                "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{player_name}.{player_id}/view)",
+                "{player_name}": f"[{player_name}](https://www.droptracker.io/players/{quote(player_name, safe='')}.{player_id}/view)",
                 "{player_loot_month}": player_month_total,
                 "{kc_received}": kc,
                 "{item_name}": item_name,
@@ -3525,7 +3526,7 @@ class NotificationService:
             xf_user_id = await get_user_id(player_id)
             if xf_user_id:
                 link_text = f"View your Profile"
-                link_url = f"https://www.droptracker.io/players/{player_name}.{player_id}/view"
+                link_url = f"https://www.droptracker.io/players/{quote(player_name, safe='')}.{player_id}/view"
                 if notif_type == 'drop':
                     alert_text = f"Your {data.get('item_name')} drop has been processed & sent to Discord."
                     link_text = f"View Drop"

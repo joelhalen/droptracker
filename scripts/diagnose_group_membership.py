@@ -109,7 +109,7 @@ def _check_db(player_name: str, wom_group_id: int):
     return player, group
 
 
-async def _check_wom(wom_group_id: int, player_wom_id: int | None):
+async def _check_wom(wom_group_id: int, player_wom_id: int | None, player_name: str = ""):
     WOM_API_KEY = os.getenv("WOM_API_KEY")
     client = wom_lib.Client(WOM_API_KEY, user_agent="@joelhalen-diagnostic")
     await client.start()
@@ -140,16 +140,16 @@ async def _check_wom(wom_group_id: int, player_wom_id: int | None):
         wom_ids = {m.player_id for m in wom_members}
 
         _hr("WOM API: target player membership check")
+        target_name = (player_name or "").lower()
         if player_wom_id is not None:
             if player_wom_id in wom_ids:
                 print(f"  [PRESENT]  wom_id {player_wom_id} IS in the WOM member list.")
             else:
                 print(f"  [ABSENT]   wom_id {player_wom_id} is NOT in the WOM member list.")
-                # Try to find the player by name
                 for m in wom_members:
                     m_player = getattr(m, "player", None)
                     display_name = getattr(m_player, "display_name", None)
-                    if display_name and "kerzington" in display_name.lower():
+                    if target_name and display_name and target_name in display_name.lower():
                         print(
                             "  HINT: found a member whose name contains the target string: "
                             f"id={m.player_id}  name={display_name}"
@@ -226,7 +226,7 @@ async def main():
     player, group = _check_db(player_name, wom_group_id)
     player_wom_id = player.wom_id if player else None
 
-    wom_ids, wom_members = await _check_wom(wom_group_id, player_wom_id)
+    wom_ids, wom_members = await _check_wom(wom_group_id, player_wom_id, player_name)
 
     if group is not None and wom_ids is not None:
         _dry_run_sync(player, group, wom_ids, wom_members)

@@ -13,6 +13,7 @@ the embed accumulates a small-text audit trail of admin changes.
 
 import json
 from datetime import datetime
+from urllib.parse import quote
 
 import interactions
 from interactions import (
@@ -276,7 +277,7 @@ async def _rebuild_notification_embed(drop, player, item, npc, group_id, db):
         "{total_value}": f"`{total_value}`",
         "{player_name}": (
             f"[{player_name}](https://www.droptracker.io/players/"
-            f"{player_name}.{player_id}/view)"
+            f"{quote(player_name, safe='')}.{player_id}/view)"
         ),
         "{image_url}": video_url or image_url,
         "{video_url}": video_url,

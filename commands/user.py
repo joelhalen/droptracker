@@ -358,6 +358,7 @@ class UserCommands(Extension):
         account_emb = Embed(title="Your Registered Accounts:",
                             description=f"{account_names}(total: `{count}`)")
         account_emb.add_field(name="/claim-rsn",value="To claim another, you can use the </claim-rsn:1269466219841327108> command.", inline=False)
+        account_emb.add_field(name="/unclaim-rsn", value="To remove an account, use the `/unclaim-rsn` command.", inline=False)
         account_emb.set_footer(text="https://www.droptracker.io/")
         await ctx.send(embed=account_emb, ephemeral=True)
     
@@ -482,6 +483,83 @@ class UserCommands(Extension):
                 embed.set_footer(text="Powered by the DropTracker | https://www.droptracker.io/")
                 await ctx.send(embed=embed)
     
+    @slash_command(name="unclaim-rsn",
+                    description="Remove a RuneScape account name from your Discord account")
+    @slash_option(name="rsn",
+                  opt_type=OptionType.STRING,
+                  description="The in-game name of the account you want to unclaim",
+                  required=True,
+                  autocomplete=True)
+    async def unclaim_rsn_command(self, ctx: SlashContext, rsn: str):
+        """
+        Unclaim a RuneScape account from the user's Discord account.
+
+        Removes the association between an OSRS account and the user's Discord
+        account, and removes the player from any groups they were added to via
+        claiming.
+
+        Args:
+            ctx (SlashContext): The slash command context
+            rsn (str): The RuneScape username to unclaim
+        """
+        self._refresh_session()
+        user = session.query(User).filter_by(discord_id=str(ctx.user.id)).first()
+
+        if not user:
+            return await ctx.send("You don't have any accounts associated with your Discord account.",
+                                  ephemeral=True)
+
+        player = get_player_by_claim_rsn(session, Player, rsn)
+
+        if not player:
+            return await ctx.send(
+                f"`{rsn}` was not found in our database.",
+                ephemeral=True
+            )
+
+        if not player.user or str(player.user.discord_id) != str(ctx.user.id):
+            return await ctx.send(
+                f"`{player.player_name}` is not currently claimed by your Discord account.",
+                ephemeral=True
+            )
+
+        # Remove player from all groups before clearing the user association
+        groups_to_remove = list(player.groups)
+        for group in groups_to_remove:
+            player.remove_group(group)
+
+        player.user = None
+        player.user_id = None
+        session.commit()
+
+        embed = Embed(
+            title="Account unclaimed",
+            description=f"`{player.player_name}` has been removed from your Discord account.\n"
+                        "You can re-claim it at any time using "
+                        f"</claim-rsn:{await get_command_id(self.bot, 'claim-rsn')}>."
+        )
+        embed.set_footer(text="Powered by the DropTracker | https://www.droptracker.io/")
+        await ctx.send(embed=embed, ephemeral=True)
+
+    @unclaim_rsn_command.autocomplete("rsn")
+    async def unclaim_rsn_autocomplete(self, ctx: AutocompleteContext):
+        """Provide autocomplete options from the user's currently claimed accounts."""
+        self._refresh_session()
+        user = session.query(User).filter_by(discord_id=str(ctx.user.id)).first()
+
+        if not user:
+            return await ctx.send(choices=[])
+
+        accounts = session.query(Player).filter_by(user_id=user.user_id).all()
+
+        if not accounts:
+            return await ctx.send(choices=[])
+
+        return await ctx.send(choices=[
+            {"name": account.player_name, "value": account.player_name}
+            for account in accounts
+        ])
+
     @slash_command(
         name="my-points",
         description="View your earned points across your groups",
