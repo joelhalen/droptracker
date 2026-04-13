@@ -54,6 +54,31 @@ _group_member_count: Dict[int, int] = {}
 _player_cache_lock = asyncio.Lock()
 _group_cache_lock = asyncio.Lock()
 
+
+def _extract_group_metadata(details: Any) -> Tuple[Optional[str], Optional[int]]:
+    """
+    Normalize group metadata across WOM response shapes.
+
+    Depending on wom.py version, group details may be exposed either directly on the
+    returned object (`details.name`, `details.member_count`) or nested under a
+    `details.group` object (`details.group.name`, `details.group.member_count`).
+    """
+    nested_group = getattr(details, "group", None)
+    group_name = getattr(nested_group, "name", None)
+    member_count = getattr(nested_group, "member_count", None)
+
+    if group_name is None:
+        group_name = getattr(details, "name", None)
+    if member_count is None:
+        member_count = getattr(details, "member_count", None)
+
+    try:
+        member_count = int(member_count) if member_count is not None else None
+    except (TypeError, ValueError):
+        member_count = None
+
+    return group_name, member_count
+
 async def _get_cached_player(username: str, force_refresh: bool) -> Optional[Tuple[Any, float]]:
     normalized = username.strip().lower()
     now = _now()
@@ -245,8 +270,7 @@ async def check_group_by_id(wom_group_id: int, *, force_refresh: bool = False):
         if result.is_ok:
             details = result.unwrap()
             members = details.memberships
-            member_count = details.group.member_count
-            group_name = details.group.name
+            group_name, member_count = _extract_group_metadata(details)
             member_ids = [member.player_id for member in members]
             await _store_group_cache(wom_group_id, member_ids)
             return group_name, member_count, members
@@ -318,16 +342,14 @@ async def fetch_group_members(
             members = details.memberships
             # Store the WOM-reported expected member count so _sync_group_from_wom
             # can detect and refuse to act on incomplete API responses.
-            try:
-                wom_expected_count = details.group.member_count
-            except AttributeError:
-                wom_expected_count = None
+            group_name, wom_expected_count = _extract_group_metadata(details)
             if wom_expected_count is not None:
-                _group_member_count[wom_group_id] = int(wom_expected_count)
-            name = details.name
+                _group_member_count[wom_group_id] = wom_expected_count
+            name = group_name
             #print(f"Group name: {name}")
             for member in members:
-                player_name = member.player.display_name
+                player_obj = getattr(member, "player", None)
+                player_name = getattr(player_obj, "display_name", None)
                 member_wom_id = member.player_id
                 existing_player = session.query(Player).filter(Player.wom_id == member_wom_id).first()
                 if existing_player:

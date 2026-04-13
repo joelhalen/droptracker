@@ -18,7 +18,7 @@ from db.models import GroupEmbed, GroupPatreon, GroupRecentDrops, NotificationQu
 from services import message_handler
 from services.components import help_components
 from services.points import award_points_to_player
-from utils.format import format_time_since_update, format_number, get_command_id, get_npc_image_url, replace_placeholders
+from utils.format import format_time_since_update, format_number, get_command_id, get_npc_image_url, replace_placeholders, normalize_player_display_equivalence
 from utils.wiseoldman import check_user_by_id, check_user_by_username, check_group_by_id, fetch_group_members
 from utils.redis import RedisClient
 from db.ops import DatabaseOperations, associate_player_ids
@@ -340,18 +340,64 @@ class UserCommands(Extension):
             group = session.query(Group).filter(Group.guild_id.ilike(guild_id)).first()
         if not group:
             group = session.query(Group).filter_by(group_id=2).first()
+        rsn = str(rsn).strip()
         player = session.query(Player).filter(Player.player_name.ilike(rsn)).first()
+        wom_player = None
+        wom_player_id = None
+        wom_player_name = rsn
+        log_slots = 0
+        try:
+            wom_data = await check_user_by_username(rsn)
+            if wom_data:
+                wom_player, wom_player_name, wom_player_id, log_slots = wom_data
+        except Exception as e:
+            print("Couldn't get WOM player data. e:", e)
+            wom_player = None
+
+        # Prefer WOM-authoritative identity when available and reconcile stale local rows.
+        if wom_player and wom_player_id not in (None, "", 0):
+            try:
+                wom_player_id = int(wom_player_id)
+            except (TypeError, ValueError):
+                wom_player_id = None
+            if wom_player_id is not None:
+                player_by_wom = session.query(Player).filter(Player.wom_id == wom_player_id).first()
+                if player_by_wom:
+                    player = player_by_wom
+                elif player and int(player.wom_id or 0) != wom_player_id:
+                    try:
+                        existing_conflict = session.query(Player).filter(Player.wom_id == wom_player_id).first()
+                        if existing_conflict and existing_conflict.player_id != player.player_id:
+                            player = existing_conflict
+                        else:
+                            player.wom_id = wom_player_id
+                            session.commit()
+                    except Exception:
+                        session.rollback()
+                if player:
+                    desired_name = str(wom_player_name or rsn)
+                    changed = False
+                    if normalize_player_display_equivalence(player.player_name or "") != normalize_player_display_equivalence(desired_name):
+                        player.player_name = desired_name
+                        changed = True
+                    if log_slots is not None and int(log_slots) >= 0 and int(player.log_slots or 0) != int(log_slots):
+                        player.log_slots = int(log_slots)
+                        changed = True
+                    if changed:
+                        try:
+                            session.commit()
+                        except Exception:
+                            session.rollback()
         ## User should be made now
         if not player:
-            try:
-                wom_data = await check_user_by_username(rsn)
-            except Exception as e:
-                print("Couldn't get player data. e:", e)
+            if not wom_player:
                 return await ctx.send(f"An error occurred claiming your account.\n" +
                                       "Try again later, or reach out in our Discord server",
                                       ephemeral=True)
-            if wom_data:
-                player, player_name, player_id, log_slots = wom_data
+            if wom_player:
+                player = wom_player
+                player_name = str(wom_player_name or rsn)
+                player_id = wom_player_id
                 try:
                     print("Creating a player with user ID", user.user_id, "associated with it")
                     ## We need to create the Player with a temporary acc hash for now

@@ -414,62 +414,84 @@ class DatabaseOperations:
             It also creates a new player notification entry.    
         """
         account_hash = str(account_hash)
-        
+
         try:
-            # Check if player exists in WiseOldMan
-            wom_player, player_name, wom_player_id, log_slots = await check_user_by_username(player_name)
-            
-            if not wom_player or not wom_player.latest_snapshot:
+            # WOM is authoritative for RSN -> WOM ID; always resolve identity via WOM first.
+            wom_player, resolved_name, wom_player_id, log_slots = await check_user_by_username(player_name)
+
+            if not wom_player or wom_player_id in (None, "", 0):
                 return None
-            
-            player = session.query(Player).filter(Player.wom_id == wom_player_id).first()
+
+            try:
+                expected_wom_id = int(wom_player_id)
+            except (TypeError, ValueError):
+                return None
+
+            canonical_name = str(resolved_name or player_name)
+            player = session.query(Player).filter(Player.wom_id == expected_wom_id).first()
             if not player:
+                # Legacy fallback rows can still exist by hash/name; reconcile those.
                 player = session.query(Player).filter(Player.account_hash == account_hash).first()
-            
+            if not player:
+                player = session.query(Player).filter(Player.player_name == player_name).first()
+
             if player is not None:
-                if normalize_player_display_equivalence(player_name) != normalize_player_display_equivalence(player.player_name):
-                    old_name = player.player_name
-                    player.player_name = player_name
-                    player.log_slots = log_slots
+                changed = False
+                old_name = player.player_name
+                if int(player.wom_id or 0) != expected_wom_id:
+                    player.wom_id = expected_wom_id
+                    changed = True
+                if normalize_player_display_equivalence(canonical_name) != normalize_player_display_equivalence(player.player_name):
+                    player.player_name = canonical_name
+                    changed = True
+                if log_slots is not None and int(log_slots) >= 0 and int(player.log_slots or 0) != int(log_slots):
+                    player.log_slots = int(log_slots)
+                    changed = True
+                if account_hash and not player.account_hash:
+                    player.account_hash = account_hash
+                    changed = True
+                if changed:
                     session.commit()
-                    
-                    # Create name change notification
-                    notification_data = {
-                        'player_name': player_name,
-                        'player_id': player.player_id,
-                        'old_name': old_name
-                    }
-                    await self.create_notification('name_change', player.player_id, notification_data)
+                    if old_name and normalize_player_display_equivalence(old_name) != normalize_player_display_equivalence(player.player_name):
+                        notification_data = {
+                            "player_name": player.player_name,
+                            "player_id": player.player_id,
+                            "old_name": old_name,
+                        }
+                        await self.create_notification("name_change", player.player_id, notification_data)
             else:
                 try:
-                    overall = wom_player.latest_snapshot.data.skills.get('overall')
+                    overall = wom_player.latest_snapshot.data.skills.get("overall")
                     total_level = overall.level
-                except Exception as e:
+                except Exception:
                     total_level = 0
-                
+
                 new_player = Player(
-                    wom_id=wom_player_id, 
-                    player_name=player_name, 
-                    account_hash=account_hash, 
+                    wom_id=expected_wom_id,
+                    player_name=canonical_name,
+                    account_hash=account_hash,
                     total_level=total_level,
-                    log_slots=log_slots
+                    log_slots=log_slots if log_slots is not None else 0,
                 )
                 session.add(new_player)
                 session.commit()
-                
-                app_logger.log(log_type="access", data=f"{player_name} has been created with ID {new_player.player_id} (hash: {account_hash}) ", app_name="core", description="create_player")
-                
+
+                app_logger.log(
+                    log_type="access",
+                    data=f"{canonical_name} has been created with ID {new_player.player_id} (hash: {account_hash}) ",
+                    app_name="core",
+                    description="create_player",
+                )
+
                 # Create new player notification
-                notification_data = {
-                    'player_name': player_name
-                }
-                await self.create_notification('new_player', new_player.player_id, notification_data)
-                
+                notification_data = {"player_name": canonical_name}
+                await self.create_notification("new_player", new_player.player_id, notification_data)
+
                 return new_player
         except Exception as e:
             app_logger.log(log_type="error", data=f"Error creating player: {e}", app_name="core", description="create_player")
             return None
-        
+
         return player
     
     async def process_drop(self, drop_data, message_id=None, message_logger=None):

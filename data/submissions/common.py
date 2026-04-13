@@ -138,6 +138,89 @@ async def get_wom_user_cached(player_name: str):
     return value
 
 
+def _to_int_or_none(value):
+    try:
+        if value in (None, "", 0):
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_total_level_from_wom_player(wom_player) -> int:
+    try:
+        overall = wom_player.latest_snapshot.data.skills.get("overall")
+        return int(overall.level)
+    except Exception:
+        return 0
+
+
+def _apply_authoritative_wom_identity(
+    db_session,
+    player: Player | None,
+    expected_wom_id: int | None,
+    *,
+    canonical_name: str | None = None,
+    total_level: int | None = None,
+    log_slots: int | None = None,
+    account_hash: str | None = None,
+):
+    """
+    Ensure the local player row reflects WOM's authoritative identity.
+
+    Returns:
+        tuple[player|None, bool]: (possibly replaced canonical player, changed_flag)
+    """
+    if player is None or expected_wom_id is None:
+        return player, False
+
+    changed = False
+    current_wom_id = _to_int_or_none(getattr(player, "wom_id", None))
+    if current_wom_id != expected_wom_id:
+        canonical = (
+            db_session.query(Player)
+            .filter(Player.wom_id == expected_wom_id)
+            .first()
+        )
+        if canonical and canonical.player_id != player.player_id:
+            player = canonical
+        else:
+            player.wom_id = expected_wom_id
+            changed = True
+
+    if canonical_name and normalize_player_display_equivalence(player.player_name or "") != normalize_player_display_equivalence(canonical_name):
+        player.player_name = canonical_name
+        changed = True
+
+    if total_level is not None and int(total_level) > 0 and int(player.total_level or 0) != int(total_level):
+        player.total_level = int(total_level)
+        changed = True
+
+    if log_slots is not None and int(log_slots) >= 0 and player.log_slots != int(log_slots):
+        player.log_slots = int(log_slots)
+        changed = True
+
+    if account_hash:
+        account_hash = str(account_hash)
+        if not player.account_hash:
+            existing_hash_owner = (
+                db_session.query(Player)
+                .filter(Player.account_hash == account_hash)
+                .first()
+            )
+            if (
+                existing_hash_owner
+                and existing_hash_owner.player_id != player.player_id
+                and _to_int_or_none(existing_hash_owner.wom_id) != expected_wom_id
+            ):
+                existing_hash_owner.account_hash = None
+                changed = True
+            player.account_hash = account_hash
+            changed = True
+
+    return player, changed
+
+
 class SubmissionResponse:
     """Response object for API submission endpoints.
 
@@ -341,120 +424,108 @@ async def ensure_player_and_auth(session, player_name, account_hash, auth_key):
 
     await asyncio.sleep(0)
 
-    # 1) Deterministic primary lookup: account hash.
+    # 1) Deterministic local lookups.
     player_by_hash = None
     if account_hash:
         player_by_hash = session.query(Player).filter(Player.account_hash == account_hash).first()
 
-    player = player_by_hash
+    player_by_name_fast = session.query(Player).filter(Player.player_name == player_name).first()
+    player = player_by_hash or player_by_name_fast
     resolved_by_name = False
     expected_wom_id = None
     wom_log_slots = None
+    wom_total_level = None
 
-    # 2) Fast local fallback by name to avoid unnecessary WOM calls for known players.
-    player_by_name_fast = None
-    if not player:
-        player_by_name_fast = session.query(Player).filter(Player.player_name == player_name).first()
-        if player_by_name_fast and player_by_name_fast.account_hash:
-            player = player_by_name_fast
-
-    # 3) If still unresolved, resolve identity via live WOM lookup and WOM ID.
-    if not player:
+    # 2) Authoritative WOM identity lookup for this RSN.
+    wom_player = None
+    canonical_name = player_name
+    try:
         # Release any open transaction before awaiting external API.
         try:
             session.rollback()
         except Exception:
             pass
         wom_player, resolved_name, wom_player_id, log_slots = await get_wom_user_cached(player_name)
-        if not wom_player or wom_player_id in (None, "", 0):
-            logger.log_sync(
-                "warning",
-                f"ensure_player_and_auth: WOM lookup failed for {player_name}; refusing name-only identity bind",
-            )
-            return None, False, False
-
-        try:
+        if wom_player and wom_player_id not in (None, "", 0):
             expected_wom_id = int(wom_player_id)
-        except (TypeError, ValueError):
-            return None, False, False
-        wom_log_slots = log_slots
+            wom_log_slots = log_slots
+            canonical_name = str(resolved_name or player_name)
+            wom_total_level = _extract_total_level_from_wom_player(wom_player)
+    except (TypeError, ValueError):
+        expected_wom_id = None
 
+    if expected_wom_id is not None:
+        # Prefer canonical WOM row over hash/name-resolved rows.
         player_by_wom = session.query(Player).filter(Player.wom_id == expected_wom_id).first()
-        player_by_name = session.query(Player).filter(Player.player_name == player_name).first()
-
         if player_by_wom:
             player = player_by_wom
-            # Keep the account hash bound to the WOM-resolved row.
-            if account_hash and not player.account_hash:
-                player.account_hash = account_hash
-                try:
-                    session.commit()
-                except Exception as e:
-                    debug_print("Error committing account hash on WOM-resolved row: " + str(e))
-                    session.rollback()
+        elif player is None:
+            player = player_by_name_fast
+            resolved_by_name = player is not None
+
+        if player is None:
+            # No local row matched: create canonical row from WOM identity.
+            total_level = wom_total_level if wom_total_level is not None else 0
+            player = Player(
+                wom_id=expected_wom_id,
+                player_name=canonical_name,
+                account_hash=account_hash if account_hash else None,
+                total_level=total_level,
+                log_slots=wom_log_slots if wom_log_slots is not None else 0,
+            )
+            try:
+                session.add(player)
+                session.commit()
+            except Exception:
+                session.rollback()
+                player = session.query(Player).filter(Player.wom_id == expected_wom_id).first()
+                if player is None:
                     return None, False, False
-            elif account_hash and player.account_hash and str(player.account_hash) != account_hash:
-                logger.log_sync(
-                    "warning",
-                    f"ensure_player_and_auth: hash mismatch for WOM {expected_wom_id}; refusing auth for {player_name}",
-                )
-                player_list[player_name] = player.player_id
-                return player, False, True
-        elif player_by_name:
-            # Name row exists but WOM ID doesn't: only safe to bind if WOM IDs agree.
-            resolved_by_name = True
-            if int(player_by_name.wom_id or 0) == expected_wom_id:
-                player = player_by_name
-            else:
-                logger.log_sync(
-                    "warning",
-                    (
-                        "ensure_player_and_auth: stale name row detected "
-                        f"(name={player_name}, stored_wom={player_by_name.wom_id}, expected_wom={expected_wom_id}); "
-                        "creating/using canonical WOM row instead"
-                    ),
-                )
+        else:
+            player, changed = _apply_authoritative_wom_identity(
+                session,
+                player,
+                expected_wom_id,
+                canonical_name=canonical_name,
+                total_level=wom_total_level,
+                log_slots=wom_log_slots,
+                account_hash=account_hash if account_hash else None,
+            )
+            if changed:
                 try:
-                    overall = wom_player.latest_snapshot.data.skills.get("overall")
-                    total_level = overall.level
-                except Exception:
-                    total_level = 0
-                player = Player(
-                    wom_id=expected_wom_id,
-                    player_name=str(resolved_name or player_name),
-                    account_hash=account_hash if account_hash else None,
-                    total_level=total_level,
-                    log_slots=wom_log_slots if wom_log_slots is not None else 0,
-                )
-                try:
-                    session.add(player)
                     session.commit()
                 except Exception as e:
+                    debug_print("Error committing WOM identity reconciliation: " + str(e))
                     session.rollback()
-                    debug_print("Error creating canonical WOM row during auth ensure: " + str(e))
-                    player = session.query(Player).filter(Player.wom_id == expected_wom_id).first()
-                    if not player:
-                        return None, False, False
-        else:
-            # Controlled fallback: no hash, no name row, no WOM row.
-            player = await create_player(player_name, account_hash, existing_session=session)
-            if not player:
-                logger.log_sync(
-                    "info",
-                    f"ensure_player_and_auth: Unable to create player after WOM resolution for {player_name}",
-                )
-                return None, False, False
+
+        # Hash conflicts are still treated as auth failures.
+        if account_hash and player and player.account_hash and str(player.account_hash) != account_hash:
+            logger.log_sync(
+                "warning",
+                f"ensure_player_and_auth: hash mismatch for WOM {expected_wom_id}; refusing auth for {player_name}",
+            )
+            player_list[player_name] = player.player_id
+            return player, False, True
+    elif not player:
+        # WOM unavailable + no deterministic local match.
+        logger.log_sync(
+            "warning",
+            f"ensure_player_and_auth: WOM lookup unavailable for {player_name}; refusing name-only bind",
+        )
+        return None, False, False
 
     if not player:
         return None, False, False
 
     if expected_wom_id is not None:
         # Keep name/log slots aligned for the canonical WOM row.
-        desired_name = player_name
+        desired_name = canonical_name or player_name
         if normalize_player_display_equivalence(player.player_name or "") != normalize_player_display_equivalence(desired_name):
             player.player_name = desired_name
         if wom_log_slots is not None and wom_log_slots >= 0 and player.log_slots != wom_log_slots:
             player.log_slots = wom_log_slots
+        if wom_total_level is not None and int(wom_total_level) > 0 and int(player.total_level or 0) != int(wom_total_level):
+            player.total_level = int(wom_total_level)
         try:
             session.commit()
         except Exception:
@@ -680,20 +751,8 @@ async def ensure_item_by_name(session, item_name):
 
 
 async def ensure_player_by_name_then_auth(session, player_name, account_hash, auth_key):
-    player = None
-    if player_name:
-        player = session.query(Player).filter(Player.player_name.ilike(player_name)).first()
-        if player and player.player_name != player_name:
-            if player.account_hash == account_hash:
-                player.player_name = player_name
-                session.commit()
-    if not player:
-        player = await create_player(player_name, account_hash, existing_session=session)
-        if not player:
-            return None, False, False
-    player_list[player_name] = player.player_id
-    user_exists, authed = check_auth(player_name, account_hash, auth_key, session)
-    return player, authed, user_exists
+    # Use the canonical identity flow so WOM stays source-of-truth for RSN -> WOM ID.
+    return await ensure_player_and_auth(session, player_name, account_hash, auth_key)
 
 
 stored_notifications = {}
@@ -752,70 +811,93 @@ async def create_notification(notification_type, player_id, data, group_id=None,
 
 
 async def create_player(player_name, account_hash, existing_session=None):
-    """Create a player without Discord-specific functionality."""
+    """Create or reconcile a player using WOM-authoritative identity."""
 
-    print("Called create_player")
     use_existing_session = existing_session is not None
     if use_existing_session:
         db_session = existing_session
     else:
         db_session = session
-    account_hash = str(account_hash)
+
+    account_hash = str(account_hash) if account_hash is not None else ""
     if not account_hash or len(account_hash) < 5:
         debug_print("Account hash is too short, aborting")
         return False
-    print("Checking if player exists again...")
-    player = db_session.query(Player).filter(Player.player_name == player_name).first()
 
+    player_name = str(player_name).strip() if player_name is not None else ""
+    if not player_name:
+        return None
+
+    # Always resolve via WOM first so RSN -> WOM ID is authoritative.
+    wom_player, resolved_name, wom_player_id, log_slots = await get_wom_user_cached(player_name)
+    if not wom_player or wom_player_id in (None, "", 0):
+        debug_print(f"WOM lookup failed for {player_name}; refusing non-authoritative create")
+        return None
+
+    try:
+        expected_wom_id = int(wom_player_id)
+    except (TypeError, ValueError):
+        return None
+
+    canonical_name = str(resolved_name or player_name)
+    wom_total_level = _extract_total_level_from_wom_player(wom_player)
+    player = db_session.query(Player).filter(Player.wom_id == expected_wom_id).first()
     if not player:
-        wom_player, player_name, wom_player_id, log_slots = await get_wom_user_cached(player_name)
-        account_hash = str(account_hash)
-        print("Returned from wom check...")
+        # Fallback to existing local identity rows and reconcile to authoritative WOM ID.
+        player = db_session.query(Player).filter(Player.account_hash == account_hash).first()
+    if not player:
+        player = db_session.query(Player).filter(Player.player_name == player_name).first()
 
-        if not wom_player:
-            print("No wom player found.")
-            return None
-
-        player = db_session.query(Player).filter(Player.wom_id == wom_player_id).first()
-        if not player:
-            player = db_session.query(Player).filter(Player.account_hash == account_hash).first()
-
-        if player is not None:
-            # Update existing player with new account hash if needed
-            if player.account_hash != account_hash:
-                player.account_hash = account_hash
-                player.log_slots = log_slots
+    if player is not None:
+        old_name = player.player_name
+        player, changed = _apply_authoritative_wom_identity(
+            db_session,
+            player,
+            expected_wom_id,
+            canonical_name=canonical_name,
+            total_level=wom_total_level,
+            log_slots=log_slots,
+            account_hash=account_hash,
+        )
+        if changed:
+            try:
                 db_session.commit()
-                debug_print(f"Updated existing player {player_name} with new account hash")
-            if normalize_player_display_equivalence(player_name) != normalize_player_display_equivalence(player.player_name):
-                old_name = player.player_name
-                player.player_name = player_name
-                player.log_slots = log_slots
-                db_session.commit()
+            except Exception as e:
+                db_session.rollback()
+                debug_print("Error committing reconciled player row: " + str(e))
+                return None
 
-                notification_data = {"player_name": player_name, "player_id": player.player_id, "old_name": old_name}
-                if player:
-                    if player.user:
-                        user = db_session.query(User).filter(User.user_id == player.user_id).first()
-                        if user:
-                            should_dm_cfg = (
-                                db_session.query(UserConfiguration)
-                                .filter(
-                                    UserConfiguration.user_id == user.user_id,
-                                    UserConfiguration.config_key == "dm_account_changes",
-                                )
-                                .first()
+            if (
+                old_name
+                and normalize_player_display_equivalence(old_name)
+                != normalize_player_display_equivalence(player.player_name)
+            ):
+                notification_data = {
+                    "player_name": player.player_name,
+                    "player_id": player.player_id,
+                    "old_name": old_name,
+                }
+                if player.user:
+                    user = db_session.query(User).filter(User.user_id == player.user_id).first()
+                    if user:
+                        should_dm_cfg = (
+                            db_session.query(UserConfiguration)
+                            .filter(
+                                UserConfiguration.user_id == user.user_id,
+                                UserConfiguration.config_key == "dm_account_changes",
                             )
-                            if should_dm_cfg:
-                                should_dm = str(should_dm_cfg.config_value).lower()
-                                should_dm = True if should_dm in ("true", "1") else False
-                                if should_dm:
-                                    await create_notification(
-                                        "dm_name_change",
-                                        player.player_id,
-                                        notification_data,
-                                        existing_session=db_session if use_existing_session else None,
-                                    )
+                            .first()
+                        )
+                        if should_dm_cfg:
+                            should_dm = str(should_dm_cfg.config_value).lower()
+                            should_dm = True if should_dm in ("true", "1") else False
+                            if should_dm:
+                                await create_notification(
+                                    "dm_name_change",
+                                    player.player_id,
+                                    notification_data,
+                                    existing_session=db_session if use_existing_session else None,
+                                )
 
                 await create_notification(
                     "name_change",
@@ -823,36 +905,39 @@ async def create_player(player_name, account_hash, existing_session=None):
                     notification_data,
                     existing_session=db_session if use_existing_session else None,
                 )
-        else:
-            # Only create new player if no existing player found
-            debug_print(f"Creating new player for {player_name}")
-            try:
-                overall = wom_player.latest_snapshot.data.skills.get("overall")
-                total_level = overall.level
-            except Exception:
-                total_level = 0
+    else:
+        try:
+            overall = wom_player.latest_snapshot.data.skills.get("overall")
+            total_level = overall.level
+        except Exception:
+            total_level = 0
 
-            new_player = Player(
-                wom_id=wom_player_id,
-                player_name=player_name,
-                account_hash=account_hash,
-                total_level=total_level,
-                log_slots=log_slots,
-            )
-            db_session.add(new_player)
+        new_player = Player(
+            wom_id=expected_wom_id,
+            player_name=canonical_name,
+            account_hash=account_hash,
+            total_level=total_level,
+            log_slots=log_slots if log_slots is not None else 0,
+        )
+        db_session.add(new_player)
+        try:
             db_session.commit()
-
-            player_list[player_name] = new_player.player_id
+        except Exception:
+            db_session.rollback()
+            player = db_session.query(Player).filter(Player.wom_id == expected_wom_id).first()
+            if not player:
+                return None
+        else:
+            player = new_player
             app_logger.log(
                 log_type="access",
-                data=f"{player_name} has been created with ID {new_player.player_id} (hash: {account_hash}) ",
+                data=f"{canonical_name} has been created with ID {new_player.player_id} (hash: {account_hash}) ",
                 app_name="core",
                 description="create_player",
             )
-
             notification_data = {
-                "player_name": player_name,
-                "wom_id": wom_player_id,
+                "player_name": canonical_name,
+                "wom_id": expected_wom_id,
                 "player_id": new_player.player_id,
                 "account_hash": account_hash,
             }
@@ -863,15 +948,9 @@ async def create_player(player_name, account_hash, existing_session=None):
                 existing_session=db_session if use_existing_session else None,
             )
 
-            return new_player
-    else:
-        # Player exists by name, update account hash if needed
-        if player.account_hash != account_hash:
-            player.account_hash = account_hash
-            db_session.commit()
-            debug_print(f"Updated existing player {player_name} with new account hash")
-        player_list[player_name] = player.player_id
-
+    player_list[player_name] = player.player_id
+    if canonical_name:
+        player_list[canonical_name] = player.player_id
     return player
 
 
@@ -879,82 +958,44 @@ async def try_create_player(bot: interactions.Client, player_name, account_hash)
     account_hash = str(account_hash)
     if not account_hash or len(account_hash) < 5:
         return False
-    player = session.query(Player).filter(Player.player_name == player_name).first()
-
+    resolved_name = str(player_name).strip() if player_name is not None else ""
+    player = await create_player(resolved_name, account_hash, existing_session=session)
     if not player:
-        print("Player not found in database, checking WOM...")
-        wom_player, player_name, wom_player_id, log_slots = await get_wom_user_cached(player_name)
-        account_hash = str(account_hash)
-        if not wom_player:
-            print("WOM player doesn't exist, and we can't update them/create them:", {player_name})
-        elif not wom_player.latest_snapshot:
-            print(f"Failed to find or create player via WOM: {player_name}. Aborting.")
-            return
-        player = session.query(Player).filter(Player.wom_id == wom_player_id).first()
-        if not player:
-            print("Player not found in database, checking account hash...")
-            player = session.query(Player).filter(Player.account_hash == account_hash).first()
-        if player is not None:
-            if normalize_player_display_equivalence(player_name) != normalize_player_display_equivalence(player.player_name):
-                old_name = player.player_name
-                player.player_name = player_name
-                player.log_slots = log_slots
-                session.commit()
-                if player.user:
-                    user: User = player.user
-                    user_discord_id = user.discord_id
-                    if user_discord_id:
-                        try:
-                            user = await bot.fetch_user(user_id=user_discord_id)
-                            if user:
-                                embed = interactions.Embed(
-                                    title=f"Name change detected:",
-                                    description=f"Your account, {old_name}, has changed names to {player_name}.",
-                                    color="#00f0f0",
-                                )
-                                embed.add_field(
-                                    name=f"Is this a mistake?",
-                                    value=f"Reach out in [our discord](https://www.droptracker.io/discord)",
-                                )
-                                embed.set_footer(global_footer)
-                                await user.send(f"Hey, <@{user.discord_id}>", embed=embed)
-                        except Exception as e:
-                            debug_print("Couldn't DM the user on a name change:" + str(e))
-                from utils.messages import name_change_message
+        return None
 
-                await name_change_message(bot, player_name, player.player_id, old_name)
-        else:
-            debug_print("Player not found in database, creating new player..." + str(e))
-            try:
-                overall = wom_player.latest_snapshot.data.skills.get("overall")
-                total_level = overall.level
-            except Exception:
-                total_level = 0
-            new_player = Player(
-                wom_id=wom_player_id,
-                player_name=player_name,
-                account_hash=account_hash,
-                total_level=total_level,
-                log_slots=log_slots,
-            )
-            session.add(new_player)
-            from utils.messages import new_player_message
+    normalized_old = normalize_player_display_equivalence(resolved_name)
+    normalized_new = normalize_player_display_equivalence(player.player_name or "")
+    if normalized_old and normalized_new and normalized_old != normalized_new:
+        old_name = resolved_name
+        new_name = player.player_name
+        if player.user:
+            user: User = player.user
+            user_discord_id = user.discord_id
+            if user_discord_id:
+                try:
+                    user = await bot.fetch_user(user_id=user_discord_id)
+                    if user:
+                        embed = interactions.Embed(
+                            title="Name change detected:",
+                            description=f"Your account, {old_name}, has changed names to {new_name}.",
+                            color="#00f0f0",
+                        )
+                        embed.add_field(
+                            name="Is this a mistake?",
+                            value="Reach out in [our discord](https://www.droptracker.io/discord)",
+                        )
+                        embed.set_footer(global_footer)
+                        await user.send(f"Hey, <@{user.discord_id}>", embed=embed)
+                except Exception as e:
+                    debug_print("Couldn't DM the user on a name change:" + str(e))
+        from utils.messages import name_change_message
 
-            await new_player_message(bot, player_name)
-            session.commit()
-            player_list[player_name] = new_player.player_id
-            app_logger.log(
-                log_type="access",
-                data=f"{player_name} has been created with ID {new_player.player_id} (hash: {account_hash}) ",
-                app_name="core",
-                description="try_create_player",
-            )
-            return new_player
-    else:
-        stored_account_hash = player.account_hash
-        if str(stored_account_hash) != account_hash:
-            debug_print("Potential fake submission from " + player_name + " with a changed account hash!!")
-        player_list[player_name] = player.player_id
+        await name_change_message(bot, new_name, player.player_id, old_name)
+
+    player_list[resolved_name] = player.player_id
+    if player.player_name:
+        player_list[player.player_name] = player.player_id
+    return player
 
 
 async def log_to_file(data):
