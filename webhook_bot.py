@@ -28,6 +28,53 @@ bot = interactions.Client(token=os.getenv("WEBHOOK_TOKEN"), intents=Intents.ALL)
 metrics = MetricsTracker()
 watchdog = None
 shutdown_event = asyncio.Event()
+MAIN_WORLD_TYPE = "main"
+
+
+def _normalize_world_type(raw_world_type):
+    if raw_world_type is None:
+        return MAIN_WORLD_TYPE
+    normalized = str(raw_world_type).strip().lower()
+    return normalized or MAIN_WORLD_TYPE
+
+
+def _normalize_submission_type(raw_submission_type):
+    normalized = str(raw_submission_type or "").strip().lower()
+    match normalized:
+        case "other" | "npc":
+            return "drop"
+        case "kill_time" | "npc_kill":
+            return "personal_best"
+        case "experience_update" | "experience_milestone" | "level_up":
+            return "experience"
+        case "quest_completion":
+            return "quest"
+        case _:
+            return normalized
+
+
+def _dispatch_non_main_submission(world_type, submission_type):
+    """Route non-main submissions by type (currently no-op handlers)."""
+    match world_type:
+        case "seasonal":
+            match submission_type:
+                case (
+                    "drop"
+                    | "collection_log"
+                    | "personal_best"
+                    | "combat_achievement"
+                    | "experience"
+                    | "quest"
+                    | "pet"
+                    | "adventure_log"
+                ):
+                    # Seasonal routing placeholder for future handlers.
+                    pass
+                case _:
+                    pass
+        case _:
+            # Ignore unsupported world types for now.
+            pass
 
 # Health check function for systemd watchdog
 async def health_check():
@@ -124,25 +171,32 @@ def retry_on_database_error(max_retries=3, delay=1):
 @retry_on_database_error(max_retries=3, delay=1)
 async def process_submission_with_session(submission_type, embed_data):
     """Process a submission with a fresh database session"""
+    world_type = _normalize_world_type(embed_data.get("world_type"))
+    embed_data["world_type"] = world_type
+    normalized_submission_type = _normalize_submission_type(submission_type)
     session = Session()
     try:
         success = False
-        if submission_type == "collection_log":
+        if world_type != MAIN_WORLD_TYPE:
+            _dispatch_non_main_submission(world_type, normalized_submission_type)
+            result = None
+            success = True
+        elif normalized_submission_type == "collection_log":
             result = await clog_processor(embed_data, external_session=session)
             success = True
-        elif submission_type == "combat_achievement":
+        elif normalized_submission_type == "combat_achievement":
             result = await ca_processor(embed_data, external_session=session)
             success = True
-        elif submission_type == "personal_best":
+        elif normalized_submission_type == "personal_best":
             result = await pb_processor(embed_data, external_session=session)
             success = True
-        elif submission_type == "drop":
+        elif normalized_submission_type == "drop":
             result = await drop_processor(embed_data, external_session=session)
             success = True
-        elif submission_type == "pet":
+        elif normalized_submission_type == "pet":
             result = await pet_processor(embed_data, external_session=session)
             success = True
-        elif submission_type == "adventure_log":
+        elif normalized_submission_type == "adventure_log":
             result = await adventure_log_processor(embed_data, external_session=session)
             success = True
         else:
@@ -151,7 +205,7 @@ async def process_submission_with_session(submission_type, embed_data):
         # Commit the session if everything succeeded
         session.commit()
         try:
-            metrics.record_request(submission_type, success, app="webhook_bot")
+            metrics.record_request(normalized_submission_type, success, app="webhook_bot")
             #print(f"Recorded request: {submission_type} {success}")
         except Exception:
             #print(f"Error recording request: {submission_type} {success}")
@@ -163,7 +217,7 @@ async def process_submission_with_session(submission_type, embed_data):
         session.rollback()
         #print(f"Error processing {submission_type}: {e}")
         try:
-            metrics.record_request(submission_type, False, app="webhook_bot")
+            metrics.record_request(normalized_submission_type, False, app="webhook_bot")
         except Exception:
             pass
         raise
@@ -218,6 +272,7 @@ async def on_message_create(event: MessageCreate):
                     continue
                     
                 embed_data['used_api'] = False
+                embed_data["world_type"] = _normalize_world_type(embed_data.get("world_type"))
                 
                 try:
                     if "collection_log" in field_values:

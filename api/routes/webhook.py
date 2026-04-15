@@ -16,11 +16,58 @@ from utils.video_storage import backend_for_video_record, get_public_video_url
 
 
 webhook_bp = Blueprint("webhook", __name__)
+MAIN_WORLD_TYPE = "main"
 
 
 def _drop_request_debug(message: str):
     """Consistent logging for drop request ingestion diagnostics."""
     print(f"[DropRequestDebug] {message}")
+
+
+def _normalize_world_type(raw_world_type):
+    if raw_world_type is None:
+        return MAIN_WORLD_TYPE
+    normalized = str(raw_world_type).strip().lower()
+    return normalized or MAIN_WORLD_TYPE
+
+
+def _normalize_submission_type(raw_submission_type):
+    normalized = str(raw_submission_type or "").strip().lower()
+    match normalized:
+        case "other" | "npc":
+            return "drop"
+        case "kill_time" | "npc_kill":
+            return "personal_best"
+        case "experience_update" | "experience_milestone" | "level_up":
+            return "experience"
+        case "quest_completion":
+            return "quest"
+        case _:
+            return normalized
+
+
+def _dispatch_non_main_submission(world_type, submission_type):
+    """Route non-main submissions by type (currently no-op handlers)."""
+    match world_type:
+        case "seasonal":
+            match submission_type:
+                case (
+                    "drop"
+                    | "collection_log"
+                    | "personal_best"
+                    | "combat_achievement"
+                    | "experience"
+                    | "quest"
+                    | "pet"
+                    | "adventure_log"
+                ):
+                    # Seasonal routing placeholder for future handlers.
+                    pass
+                case _:
+                    pass
+        case _:
+            # Ignore all unsupported world types for now.
+            pass
 
 
 async def _link_video_to_submission(processed_data, db_session):
@@ -175,6 +222,15 @@ async def _process_webhook_request(req_start):
                         submission_type = processed_data.get("type")
                         g.submission_type = submission_type or g.submission_type
                         processed_data["downloaded"] = False
+                        world_type = _normalize_world_type(processed_data.get("world_type"))
+                        processed_data["world_type"] = world_type
+
+                        if world_type != MAIN_WORLD_TYPE:
+                            _dispatch_non_main_submission(
+                                world_type,
+                                _normalize_submission_type(submission_type),
+                            )
+                            continue
 
                         if image_file:
                             processed_data["has_image"] = True
@@ -320,6 +376,7 @@ async def process_webhook_data(webhook_data):
             }
             if not processed_data.get("timestamp"):
                 processed_data["timestamp"] = int(datetime.now().timestamp())
+            processed_data["world_type"] = _normalize_world_type(processed_data.get("world_type"))
             submission_type = str(processed_data.get("type", "")).lower()
             if submission_type in ("drop", "npc", "other"):
                 raw_nearby_players = processed_data.get("nearby_players")
@@ -366,6 +423,7 @@ async def process_webhook_data(webhook_data):
 # 2. MULTIPART FORM DATA - when an image file is uploaded:
 #    - All fields sent as form fields
 #    - Image sent as "image_file" field (CURLFile in PHP)
+# "world_type": string|null,  // Optional. Defaults to "main" when omitted.
 #
 # === DROP SUBMISSION FIELDS ===
 # submission_type: "drop"
@@ -542,6 +600,15 @@ async def _process_manual_submission(req_start):
                 "success": False, 
                 "error": f"Invalid submission_type: {submission_type}. Must be one of: {', '.join(valid_types)}"
             }), 400
+
+        world_type = _normalize_world_type(data.get("world_type"))
+        if world_type != MAIN_WORLD_TYPE:
+            _dispatch_non_main_submission(world_type, _normalize_submission_type(submission_type))
+            success = True
+            return jsonify({
+                "success": True,
+                "message": f"Ignored {submission_type} submission for world_type '{world_type}'"
+            }), 200
         
         # Generate a unique ID for this submission
         unique_id = str(uuid.uuid4())
@@ -557,6 +624,7 @@ async def _process_manual_submission(req_start):
             "guid": unique_id,
             "used_api": True,
             "downloaded": False,
+            "world_type": world_type,
             "image_url": data.get("image_url"),
             "timestamp": datetime.now().isoformat(),
         }
