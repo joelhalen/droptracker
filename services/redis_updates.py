@@ -336,68 +336,57 @@ class RedisLootTracker:
         """Internal force update implementation"""
         if session_to_use is None:
             session_to_use = session
-        
+
         try:
-            # Get player with groups
             player = session_to_use.query(Player).filter(Player.player_id == player_id).options(joinedload(Player.groups)).first()
             if not player:
                 print(f"Player {player_id} not found")
                 return False
-            
-            # Get player's group IDs
+
             player_group_ids = [group.group_id for group in player.groups]
-            print(f"Player {player_id} belongs to groups: {player_group_ids}")
-            
-            # Get all visible drops for the player (exclude hidden)
+
+            # Clear all player keys and remove from every leaderboard partition/group
+            # before touching any drop data so stale entries are gone.
+            self._clear_player_redis_data(player_id)
+            self._remove_from_all_leaderboards(player_id, player_group_ids)
+
+            # Only count visible drops toward leaderboards and totals
             player_drops = session_to_use.query(Drop).filter(
                 Drop.player_id == player_id,
                 Drop.hidden != True,
             ).order_by(Drop.date_added.asc()).all()
-            
+
             if not player_drops:
-                # No drops, clear Redis data and remove from leaderboards
-                self._clear_player_redis_data(player_id)
-                self._remove_from_leaderboards(player_id, player_group_ids)
                 return True
-            
-            # Group drops by partition (monthly) and by day
-            partition_drops = {}  # monthly partitions
-            daily_drops = {}      # daily partitions
-            
+
+            # Group drops by monthly partition and by calendar day
+            partition_drops: Dict[int, list] = {}
+            daily_drops: Dict[str, list] = {}
+
             for drop in player_drops:
-                # Monthly partition
-                partition = drop.partition
-                if partition not in partition_drops:
-                    partition_drops[partition] = []
-                partition_drops[partition].append(drop)
-                
-                # Daily partition
-                daily_partition = drop.date_added.strftime('%Y%m%d')
-                if daily_partition not in daily_drops:
-                    daily_drops[daily_partition] = []
-                daily_drops[daily_partition].append(drop)
-            
-            # Clear existing Redis data
-            self._clear_player_redis_data(player_id)
-            self._remove_from_leaderboards(player_id, player_group_ids)
-            
-            # Rebuild Redis data for each monthly partition and update leaderboards
+                partition_drops.setdefault(drop.partition, []).append(drop)
+                daily_key = drop.date_added.strftime('%Y%m%d')
+                daily_drops.setdefault(daily_key, []).append(drop)
+
+            # Rebuild per-partition data and update leaderboards
             for partition, drops in partition_drops.items():
                 total_loot = self._rebuild_partition_data(player_id, partition, drops)
-                # Update leaderboards for this partition
                 self.update_leaderboards(player_id, total_loot, partition, player_group_ids)
-                print(f"Updated leaderboards for player {player_id} in partition {partition}")
-            
-            # Rebuild Redis data for each daily partition
+
+            # Rebuild daily data
             for daily_partition, drops in daily_drops.items():
                 self._rebuild_daily_data(player_id, daily_partition, drops)
-                print(f"Updated daily data for player {player_id} on {daily_partition}")
-            # Update player's last update timestamp
+
+            # Rebuild all-time keys from the full drop set (fixes the overwrite bug
+            # where _rebuild_partition_data was called per partition and clobbered
+            # the all-time keys with only that partition's data each time).
+            self._rebuild_all_time_data(player_id, player_drops)
+
             player.date_updated = datetime.now()
             session_to_use.commit()
-            
+
             return True
-            
+
         except Exception as e:
             print(f"Force update failed for player {player_id}: {e}")
             return False
@@ -410,23 +399,6 @@ class RedisLootTracker:
         
         if keys:
             redis_client.client.delete(*keys)
-    
-    def _remove_from_leaderboards(self, player_id: int, group_ids: List[int]):
-        """Remove player from all leaderboards"""
-        current_partition = self._get_partition()
-        
-        pipeline = redis_client.client.pipeline(transaction=True)
-        
-        # Remove from global leaderboard
-        global_key = f"leaderboard:{current_partition}"
-        pipeline.zrem(global_key, player_id)
-        
-        # Remove from group leaderboards
-        for group_id in group_ids:
-            group_key = f"leaderboard:{current_partition}:group:{group_id}"
-            pipeline.zrem(group_key, player_id)
-        
-        pipeline.execute()
     
     def _rebuild_partition_data(self, player_id: int, partition: int, drops: List[Drop]) -> int:
         """Rebuild Redis data for a specific partition. Returns total loot value."""
@@ -463,30 +435,26 @@ class RedisLootTracker:
         
         # Use pipeline for atomic updates
         pipeline = redis_client.client.pipeline(transaction=True)
-        
-        # Set total loot
+
+        # Set total loot for this partition only
         pipeline.set(keys['total_loot'], total_loot)
-        pipeline.set(keys['all_time_total_loot'], total_loot)
 
         recent_items_raw.sort(key=lambda x: x['date_added'])
         recent_items = [json.dumps(item) for item in recent_items_raw]
-        
-        # Set item data
+
+        # Set item data for this partition only
         for item_id, (qty, val, count, first, last) in item_data.items():
             item_value = f"{qty},{val},{count},{first},{last}"
             pipeline.hset(keys['total_items'], item_id, item_value)
-            pipeline.hset(keys['all_time_total_items'], item_id, item_value)
-        
-        # Set recent items
+
+        # Set recent items for this partition only
         if recent_items_raw:
             pipeline.delete(keys['recent_items'])
-            pipeline.delete(keys['all_time_recent_items'])
-            pipeline.lpush(keys['recent_items'], *recent_items)  # Use recent_items, not recent_items_raw
-            pipeline.lpush(keys['all_time_recent_items'], *recent_items)  # Use recent_items, not recent_items_raw
-        
+            pipeline.lpush(keys['recent_items'], *recent_items)
+
         # Execute all operations
         pipeline.execute()
-        
+
         return total_loot
     
     def _rebuild_daily_data(self, player_id: int, daily_partition: str, drops: List[Drop]) -> int:
@@ -562,6 +530,77 @@ class RedisLootTracker:
         
         return total_loot
     
+    def _rebuild_all_time_data(self, player_id: int, all_drops: List) -> int:
+        """
+        Rebuild the all-time Redis keys from the complete list of visible drops.
+        Must be called once after all per-partition rebuilds so the all-time
+        totals reflect every partition, not just the last one processed.
+        """
+        all_time_loot_key = f"player:{player_id}:all:total_loot"
+        all_time_items_key = f"player:{player_id}:all:total_items"
+        all_time_recent_key = f"player:{player_id}:all:recent_items"
+
+        item_data = {}
+        total_loot = 0
+        recent_items_raw = []
+
+        for drop in all_drops:
+            total_value = drop.value * drop.quantity
+            total_loot += total_value
+            drop_timestamp = drop.date_added.strftime('%Y-%m-%d %H:%M:%S')
+
+            if drop.item_id not in item_data:
+                item_data[drop.item_id] = (0, 0, 0, drop_timestamp, drop_timestamp)
+            qty, val, count, first, _ = item_data[drop.item_id]
+            item_data[drop.item_id] = (qty + drop.quantity, val + total_value, count + 1, first, drop_timestamp)
+
+            if drop.value * drop.quantity > 1_000_000:
+                recent_items_raw.append({
+                    'drop_id': drop.drop_id,
+                    'item_id': drop.item_id,
+                    'npc_id': drop.npc_id,
+                    'value': drop.value,
+                    'quantity': drop.quantity,
+                    'total_value': total_value,
+                    'date_added': drop_timestamp,
+                })
+
+        pipeline = redis_client.client.pipeline(transaction=True)
+        pipeline.set(all_time_loot_key, total_loot)
+
+        pipeline.delete(all_time_items_key)
+        for item_id, (qty, val, count, first, last) in item_data.items():
+            pipeline.hset(all_time_items_key, item_id, f"{qty},{val},{count},{first},{last}")
+
+        recent_items_raw.sort(key=lambda x: x['date_added'])
+        if recent_items_raw:
+            pipeline.delete(all_time_recent_key)
+            # Keep the 100 most recent high-value drops
+            to_store = recent_items_raw[-100:]
+            pipeline.lpush(all_time_recent_key, *[json.dumps(i) for i in to_store])
+
+        pipeline.execute()
+        return total_loot
+
+    def _remove_from_all_leaderboards(self, player_id: int, group_ids: List[int]):
+        """
+        Remove a player from every leaderboard sorted set in Redis.
+        Scans all leaderboard keys (main + seasonal) so historical partitions
+        and old group memberships are fully cleared before a rebuild.
+        """
+        main_keys = redis_client.client.keys("leaderboard:*")
+        seasonal_keys = redis_client.client.keys("seasonal:leaderboard:*")
+        all_keys = [k.decode('utf-8') if isinstance(k, bytes) else k
+                    for k in (main_keys + seasonal_keys)]
+
+        if not all_keys:
+            return
+
+        pipeline = redis_client.client.pipeline(transaction=False)
+        for key in all_keys:
+            pipeline.zrem(key, player_id)
+        pipeline.execute()
+
     def generate_loot_leaderboard(self, query: LootLeaderboardQuery) -> Dict:
         """
         Generate a comprehensive loot leaderboard based on query parameters.
@@ -736,6 +775,97 @@ class RedisLootTracker:
                 print(f"Updated group leaderboard {group_id} for player {player_id} with value {total_value:,}")
         
         pipeline.execute()
+
+    def force_update_group(self, group_id: int, session_to_use=None,
+                           progress_callback=None) -> Dict:
+        """
+        Force update Redis for every player in a group.
+        Each player is processed with its own fresh database session.
+        """
+        from db.models.base import get_fresh_session
+        from db import user_group_association
+
+        start_time = datetime.now()
+        result: Dict = {
+            'started_at': start_time.isoformat(),
+            'group_id': group_id,
+            'total_players': 0,
+            'successful_updates': 0,
+            'failed_updates': 0,
+            'errors': [],
+            'completed_at': None,
+            'duration_seconds': 0,
+        }
+
+        list_session = None
+        try:
+            list_session = get_fresh_session()
+            player_ids = [
+                row[0]
+                for row in list_session
+                    .query(user_group_association.c.player_id)
+                    .filter(
+                        user_group_association.c.group_id == group_id,
+                        user_group_association.c.player_id != None,
+                    )
+                    .all()
+            ]
+            result['total_players'] = len(player_ids)
+
+            if not player_ids:
+                print(f"No players found in group {group_id}")
+                result['completed_at'] = datetime.now().isoformat()
+                result['duration_seconds'] = 0
+                return result
+
+            print(f"Force updating {len(player_ids)} players in group {group_id}")
+
+            for i, player_id in enumerate(player_ids, 1):
+                player_session = None
+                try:
+                    player_session = get_fresh_session()
+                    success = self.force_update_player(player_id, player_session)
+                    if success:
+                        result['successful_updates'] += 1
+                        print(f"  ✓ Player {player_id} ({i}/{len(player_ids)})")
+                    else:
+                        result['failed_updates'] += 1
+                        result['errors'].append(f"Force update returned False for player {player_id}")
+                        print(f"  ✗ Player {player_id} failed")
+                except Exception as e:
+                    result['failed_updates'] += 1
+                    result['errors'].append(f"Exception for player {player_id}: {e}")
+                    print(f"  ✗ Player {player_id} error: {e}")
+                finally:
+                    if player_session:
+                        try:
+                            player_session.close()
+                        except Exception:
+                            pass
+
+                if progress_callback:
+                    progress_callback({
+                        'completed_players': i,
+                        'total_players': len(player_ids),
+                        'successful': result['successful_updates'],
+                        'failed': result['failed_updates'],
+                    })
+
+        except Exception as e:
+            result['errors'].append(f"Fatal error: {e}")
+            print(f"Fatal error in force_update_group({group_id}): {e}")
+        finally:
+            if list_session:
+                try:
+                    list_session.close()
+                except Exception:
+                    pass
+
+        end_time = datetime.now()
+        result['completed_at'] = end_time.isoformat()
+        result['duration_seconds'] = (end_time - start_time).total_seconds()
+        return result
+
 
 # Global instance
 loot_tracker = RedisLootTracker()
@@ -1099,7 +1229,128 @@ class BulkRedisUpdater:
                 except Exception as e:
                     print(f"Warning: Error closing list session: {e}")
     
-    def force_update_specific_players(self, player_ids: List[int], 
+    def _stream_all_player_ids(self, session_to_use, chunk_size: int) -> Iterable[int]:
+        """Stream every player_id in the database in ascending order, chunk by chunk."""
+        last_player_id = -1
+        stmt = text(
+            """
+            SELECT player_id FROM players
+            WHERE player_id > :last_player_id
+            ORDER BY player_id
+            LIMIT :chunk_size
+            """
+        )
+        while True:
+            result = session_to_use.execute(
+                stmt, {"last_player_id": last_player_id, "chunk_size": chunk_size}
+            )
+            rows = result.fetchall()
+            result.close()
+            if not rows:
+                break
+            last_player_id = rows[-1][0]
+            for row in rows:
+                yield row[0]
+
+    def force_update_all_players(self, session_to_use=None,
+                                 progress_callback=None) -> Dict:
+        """
+        Force update Redis for every player in the database, regardless of
+        whether they have current-month drops.  Streams IDs to avoid OOM.
+        """
+        start_time = datetime.now()
+        result: Dict = {
+            'started_at': start_time.isoformat(),
+            'total_players': 0,
+            'successful_updates': 0,
+            'failed_updates': 0,
+            'errors': [],
+            'completed_at': None,
+            'duration_seconds': 0,
+        }
+
+        list_session = None
+        try:
+            from db.models.base import get_fresh_session
+            list_session = get_fresh_session()
+
+            player_ids = list(self._stream_all_player_ids(list_session, self.player_fetch_chunk_size))
+            result['total_players'] = len(player_ids)
+
+            if not player_ids:
+                print("No players found in database")
+                result['completed_at'] = datetime.now().isoformat()
+                result['duration_seconds'] = 0
+                return result
+
+            print(f"Starting global Redis update for all {len(player_ids)} players")
+            total_batches = (len(player_ids) + self.batch_size - 1) // self.batch_size
+
+            for i in range(0, len(player_ids), self.batch_size):
+                batch = player_ids[i:i + self.batch_size]
+                batch_num = (i // self.batch_size) + 1
+                print(f"Processing batch {batch_num}/{total_batches} ({len(batch)} players)")
+
+                for player_id in batch:
+                    player_session = None
+                    try:
+                        player_session = get_fresh_session()
+                        success = self.loot_tracker.force_update_player(player_id, player_session)
+                        if success:
+                            result['successful_updates'] += 1
+                            print(f"  ✓ Player {player_id}")
+                        else:
+                            result['failed_updates'] += 1
+                            result['errors'].append(f"Force update returned False for player {player_id}")
+                            print(f"  ✗ Player {player_id} failed")
+                    except Exception as e:
+                        result['failed_updates'] += 1
+                        result['errors'].append(f"Exception for player {player_id}: {e}")
+                        print(f"  ✗ Player {player_id} error: {e}")
+                    finally:
+                        if player_session:
+                            try:
+                                player_session.close()
+                            except Exception:
+                                pass
+
+                if progress_callback:
+                    completed = result['successful_updates'] + result['failed_updates']
+                    progress_callback({
+                        'batch': batch_num,
+                        'total_batches': total_batches,
+                        'completed_players': completed,
+                        'total_players': result['total_players'],
+                        'successful': result['successful_updates'],
+                        'failed': result['failed_updates'],
+                    })
+
+                if batch_num < total_batches:
+                    time.sleep(0.5)
+
+            end_time = datetime.now()
+            result['completed_at'] = end_time.isoformat()
+            result['duration_seconds'] = (end_time - start_time).total_seconds()
+
+            print(f"\nGlobal update complete: {result['successful_updates']} ok, "
+                  f"{result['failed_updates']} failed, {result['duration_seconds']:.1f}s")
+            return result
+
+        except Exception as e:
+            end_time = datetime.now()
+            result['completed_at'] = end_time.isoformat()
+            result['duration_seconds'] = (end_time - start_time).total_seconds()
+            result['errors'].append(f"Fatal error: {e}")
+            print(f"Fatal error in force_update_all_players: {e}")
+            return result
+        finally:
+            if list_session:
+                try:
+                    list_session.close()
+                except Exception:
+                    pass
+
+    def force_update_specific_players(self, player_ids: List[int],
                                     session_to_use=None, progress_callback=None) -> Dict:
         """
         Force update Redis cache for specific players.
@@ -1217,6 +1468,14 @@ def force_update_specific_players(player_ids: List[int], session_to_use=None, pr
 def get_players_with_current_month_drops(session_to_use=None) -> List[int]:
     """Get all player IDs with drops in current month"""
     return bulk_updater.get_players_with_current_month_drops(session_to_use)
+
+def force_update_group(group_id: int, session_to_use=None, progress_callback=None) -> Dict:
+    """Force update all players in a specific group"""
+    return loot_tracker.force_update_group(group_id, session_to_use, progress_callback)
+
+def force_update_all_players(session_to_use=None, progress_callback=None) -> Dict:
+    """Force update every player in the database (global rebuild)"""
+    return bulk_updater.force_update_all_players(session_to_use, progress_callback)
 
 
 if __name__ == "__main__":
