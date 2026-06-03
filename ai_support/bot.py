@@ -6,16 +6,22 @@ Responds to:
   • Direct @-mentions of the bot in any channel
   • The /ask slash command (guild and DM-compatible)
   • The /support_clear slash command to reset conversation history
+  • Button clicks from routing responses (ai_help_player, ai_help_group, ai_help_solo)
 
-Rate-limits users to one query per RATE_LIMIT_SECONDS to prevent abuse.
+The knowledge base is checked here before falling through to Claude, so that
+routing responses (which need to send Discord components) are handled at this
+layer rather than inside the API client.
 """
 
 import os
 import time
-from typing import Optional
+from typing import Optional, Union
 
 import interactions
 from interactions import (
+    ActionRow,
+    Button,
+    ButtonStyle,
     Extension,
     OptionType,
     SlashContext,
@@ -23,9 +29,10 @@ from interactions import (
     slash_command,
     slash_option,
 )
-from interactions.api.events import MessageCreate, Startup
+from interactions.api.events import Component, MessageCreate, Startup
 
 from .claude_client import ClaudeClient
+from .knowledge_base import ROUTED_RESPONSES, match_knowledge
 
 # Channel names (partial match) that trigger AI responses to plain messages
 SUPPORT_CHANNEL_NAMES: frozenset[str] = frozenset(
@@ -68,6 +75,62 @@ class AISupportBot(Extension):
         self._rate_limits[user_id] = time.monotonic()
 
     # ------------------------------------------------------------------
+    # Knowledge base dispatch
+    # ------------------------------------------------------------------
+
+    def _build_route_components(self, buttons: list[dict]) -> list[ActionRow]:
+        """Build an ActionRow from a routing dict's button list."""
+        return [
+            ActionRow(
+                *[
+                    Button(
+                        label=b["label"],
+                        style=ButtonStyle.PRIMARY,
+                        custom_id=b["custom_id"],
+                    )
+                    for b in buttons
+                ]
+            )
+        ]
+
+    async def _handle_kb_response(
+        self,
+        kb_result: Union[str, dict],
+        send_fn,
+        ephemeral: bool = False,
+    ) -> None:
+        """
+        Send a knowledge base response via *send_fn*.
+
+        send_fn must accept keyword arguments: content, components, ephemeral.
+        Plain str responses are sent as text; route dicts are sent with buttons.
+        """
+        if isinstance(kb_result, dict) and kb_result.get("type") == "route":
+            components = self._build_route_components(kb_result["buttons"])
+            await send_fn(
+                content=kb_result["text"],
+                components=components,
+                ephemeral=ephemeral,
+            )
+        else:
+            await send_fn(content=_truncate(str(kb_result)), ephemeral=ephemeral)
+
+    # ------------------------------------------------------------------
+    # Component handler (routing button clicks)
+    # ------------------------------------------------------------------
+
+    @listen(Component)
+    async def on_component(self, event: Component) -> None:
+        ctx = event.ctx
+        custom_id = ctx.custom_id
+
+        routed = ROUTED_RESPONSES.get(custom_id)
+        if routed is None:
+            return
+
+        await ctx.send(content=_truncate(routed), ephemeral=True)
+
+    # ------------------------------------------------------------------
     # Slash commands
     # ------------------------------------------------------------------
 
@@ -82,8 +145,6 @@ class AISupportBot(Extension):
         opt_type=OptionType.STRING,
     )
     async def ask_command(self, ctx: SlashContext, question: str) -> None:
-        await ctx.defer()
-
         user_id = int(ctx.user.id)
         guild_id = int(ctx.guild_id) if ctx.guild_id else None
 
@@ -97,13 +158,25 @@ class AISupportBot(Extension):
 
         self._record_query(user_id)
 
+        # Check knowledge base before hitting Claude
+        kb_result = match_knowledge(question)
+        if kb_result is not None:
+            await ctx.defer(ephemeral=False)
+
+            async def _send(**kwargs):
+                await ctx.send(**kwargs)
+
+            await self._handle_kb_response(kb_result, _send)
+            return
+
+        # Fall through to Claude
+        await ctx.defer()
         response = await self.claude.query(
             user_message=question,
             guild_id=guild_id,
             user_id=user_id,
             username=str(ctx.user.username),
         )
-
         await ctx.send(_truncate(response))
 
     @slash_command(
@@ -153,8 +226,6 @@ class AISupportBot(Extension):
 
         cooldown = self._cooldown_remaining(user_id)
         if cooldown > 0:
-            # Silently ignore rate-limited messages in channels;
-            # send a quiet ephemeral-style reply only for direct mentions
             if mentioned:
                 try:
                     await message.reply(
@@ -171,17 +242,31 @@ class AISupportBot(Extension):
         except Exception:
             pass
 
-        response = await self.claude.query(
-            user_message=content,
-            guild_id=guild_id,
-            user_id=user_id,
-            username=str(message.author.username),
-        )
+        # Check knowledge base before hitting Claude
+        kb_result = match_knowledge(content)
+        if kb_result is not None:
+            async def _send(**kwargs):
+                # Message replies don't support ephemeral; drop that kwarg
+                kwargs.pop("ephemeral", None)
+                await message.reply(**kwargs)
 
+            try:
+                await self._handle_kb_response(kb_result, _send)
+            except Exception as exc:
+                print(f"[AISupportBot] Failed to send KB reply: {exc}")
+            return
+
+        # Fall through to Claude
         try:
+            response = await self.claude.query(
+                user_message=content,
+                guild_id=guild_id,
+                user_id=user_id,
+                username=str(message.author.username),
+            )
             await message.reply(_truncate(response))
         except Exception as exc:
-            print(f"[AISupportBot] Failed to send reply: {exc}")
+            print(f"[AISupportBot] Failed to send Claude reply: {exc}")
 
     # ------------------------------------------------------------------
     # Startup
